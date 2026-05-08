@@ -27,6 +27,7 @@ Native desktop communications app over VX6 SDK (Linux-first baseline).
 - Per-message key evolution with sequence-based ratchet key derivation (foundation for full Double Ratchet)
 - Presence + typing protocol over DHT keys
 - Call signaling over DHT + WebRTC offer/answer/ICE negotiation path
+- Live RTP media capture pipeline (camera+mic) via local `ffmpeg` feed into WebRTC tracks
 - Local offline state persistence (`vx6comms-state.json`)
 - Name conflict check before start/rename:
   - validates format
@@ -56,6 +57,14 @@ Run org mode:
 ```bash
 ./vx6comms org
 ```
+
+## Media Call Prerequisites
+
+- Install `ffmpeg` on the host.
+- Linux capture defaults currently use:
+  - video: `/dev/video0` (v4l2)
+  - audio: `pulse` device `default`
+- If these devices are unavailable, the app falls back to synthetic RTP keepalive frames so signaling/transport stays testable.
 
 ## Cross-build (next)
 

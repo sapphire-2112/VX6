@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"os/exec"
+	"runtime"
 	"sync"
 	"time"
 
@@ -28,6 +31,8 @@ type rtcSession struct {
 	peerID    string
 	pc        *webrtc.PeerConnection
 	videoSSRC uint32
+	audioSSRC uint32
+	ffmpegCmd *exec.Cmd
 	stop      context.CancelFunc
 	lastSigID string
 }
@@ -55,6 +60,7 @@ func (s *state) ensureRTCSession(peer peerContact) (*rtcSession, error) {
 		peerID:    peer.NodeID,
 		pc:        pc,
 		videoSSRC: 424242,
+		audioSSRC: 525252,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ss.stop = cancel
@@ -67,14 +73,36 @@ func (s *state) ensureRTCSession(peer peerContact) (*rtcSession, error) {
 		cancel()
 		return nil, err
 	}
+	_, err = pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendrecv,
+	})
+	if err != nil {
+		_ = pc.Close()
+		cancel()
+		return nil, err
+	}
 	videoTrack, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
 		MimeType:  webrtc.MimeTypeVP8,
 		ClockRate: 90000,
 	}, "video", "vx6")
-	if err == nil {
-		_, _ = pc.AddTrack(videoTrack)
-		go s.pushSyntheticRTP(ctx, videoTrack, ss.videoSSRC)
+	if err != nil {
+		_ = pc.Close()
+		cancel()
+		return nil, err
 	}
+	audioTrack, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
+		MimeType:  webrtc.MimeTypeOpus,
+		ClockRate: 48000,
+		Channels:  2,
+	}, "audio", "vx6")
+	if err != nil {
+		_ = pc.Close()
+		cancel()
+		return nil, err
+	}
+	_, _ = pc.AddTrack(videoTrack)
+	_, _ = pc.AddTrack(audioTrack)
+	go s.startCapturePipeline(ctx, ss, videoTrack, audioTrack)
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -141,6 +169,132 @@ func (s *state) pushSyntheticRTP(ctx context.Context, track *webrtc.TrackLocalSt
 			}
 			_ = track.WriteRTP(pkt)
 		}
+	}
+}
+
+func (s *state) startCapturePipeline(ctx context.Context, ss *rtcSession, videoTrack, audioTrack *webrtc.TrackLocalStaticRTP) {
+	vConn, vPort, err := listenRTPPort()
+	if err != nil {
+		go s.pushSyntheticRTP(ctx, videoTrack, ss.videoSSRC)
+		return
+	}
+	defer vConn.Close()
+	aConn, aPort, err := listenRTPPort()
+	if err != nil {
+		go s.pushSyntheticRTP(ctx, videoTrack, ss.videoSSRC)
+		return
+	}
+	defer aConn.Close()
+
+	cmd := buildFFmpegCaptureCommand(vPort, aPort)
+	if cmd == nil {
+		go s.pushSyntheticRTP(ctx, videoTrack, ss.videoSSRC)
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		go s.pushSyntheticRTP(ctx, videoTrack, ss.videoSSRC)
+		return
+	}
+	ss.mu.Lock()
+	ss.ffmpegCmd = cmd
+	ss.mu.Unlock()
+
+	go relayRTP(ctx, vConn, videoTrack)
+	go relayRTP(ctx, aConn, audioTrack)
+
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+	case <-done:
+	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+}
+
+func listenRTPPort() (*net.UDPConn, int, error) {
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		return nil, 0, err
+	}
+	c, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return nil, 0, err
+	}
+	return c, c.LocalAddr().(*net.UDPAddr).Port, nil
+}
+
+func relayRTP(ctx context.Context, conn *net.UDPConn, track *webrtc.TrackLocalStaticRTP) {
+	buf := make([]byte, 1800)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				continue
+			}
+		}
+		var pkt rtp.Packet
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			continue
+		}
+		_ = track.WriteRTP(&pkt)
+	}
+}
+
+func buildFFmpegCaptureCommand(videoPort, audioPort int) *exec.Cmd {
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return nil
+	}
+	baseOut := []string{
+		"-analyzeduration", "0",
+		"-probesize", "32",
+		"-vcodec", "libvpx",
+		"-deadline", "realtime",
+		"-cpu-used", "5",
+		"-f", "rtp",
+		fmt.Sprintf("rtp://127.0.0.1:%d", videoPort),
+		"-acodec", "libopus",
+		"-f", "rtp",
+		fmt.Sprintf("rtp://127.0.0.1:%d", audioPort),
+	}
+	build := func(prefix []string) *exec.Cmd {
+		args := append(prefix, baseOut...)
+		return exec.Command(ffmpegPath, args...)
+	}
+	switch runtime.GOOS {
+	case "linux":
+		return build([]string{
+			"-f", "v4l2", "-i", "/dev/video0",
+			"-f", "pulse", "-i", "default",
+			"-pix_fmt", "yuv420p",
+			"-r", "30",
+			"-s", "640x360",
+		})
+	case "windows":
+		return build([]string{
+			"-f", "dshow", "-i", "video=default:audio=default",
+			"-pix_fmt", "yuv420p",
+			"-r", "30",
+			"-s", "640x360",
+		})
+	case "darwin":
+		return build([]string{
+			"-f", "avfoundation", "-i", "0:0",
+			"-pix_fmt", "yuv420p",
+			"-r", "30",
+			"-s", "640x360",
+		})
+	default:
+		return nil
 	}
 }
 
